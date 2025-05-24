@@ -78,12 +78,6 @@ class CAR(Platforms):
     ],
     CarSpecs(mass=2100., wheelbase=2.959, steerRatio=15.0),
   )
-  TESLA_MODEL_S_PREAP = TeslaPreAPPlatformConfig(
-    [
-      TeslaCarDocsPreAP("Tesla Model S (Pre-Autopilot) 2012-2015"),
-    ],
-    CarSpecs(mass=2100., wheelbase=2.959, steerRatio=15.0),
-  )
 
 
 FW_QUERY_CONFIG = FwQueryConfig(
