@@ -1,107 +1,182 @@
-import numpy as np
-import math
 from opendbc.can.packer import CANPacker
-from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, AngleSteeringLimits, DT_CTRL, rate_limit
-from opendbc.car.interfaces import CarControllerBase, ISO_LATERAL_ACCEL
-from opendbc.car.tesla.teslacan import TeslaCAN
-from opendbc.car.tesla.values import CarControllerParams
-from opendbc.car.vehicle_model import VehicleModel
+from openpilot.selfdrive.car import apply_std_steer_angle_limits
+from openpilot.selfdrive.car.tesla.teslacan import TeslaCAN
 
-# limit angle rate to both prevent a fault and for low speed comfort (~12 mph rate down to 0 mph)
-MAX_ANGLE_RATE = 5  # deg/20ms frame, EPS faults at 12 at a standstill
+from openpilot.selfdrive.car.tesla.HUD_module import HUDController
+from openpilot.selfdrive.car.tesla.LONG_module import LONGController
+from openpilot.selfdrive.car.modules.CFG_module import load_bool_param
+from openpilot.selfdrive.car.tesla.values import DBC, CAR, CarControllerParams, CAN_CHASSIS, CAN_AUTOPILOT, CAN_EPAS, CruiseButtons
+import cereal.messaging as messaging
+from openpilot.common.numpy_fast import clip
+from cereal import log
+import datetime
+import time
+import math
+from openpilot.common.params import Params
 
-# Add extra tolerance for average banked road since safety doesn't have the roll
-AVERAGE_ROAD_ROLL = 0.06  # ~3.4 degrees, 6% superelevation. higher actual roll lowers lateral acceleration
-MAX_LATERAL_ACCEL = ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL)  # ~3.6 m/s^2
-MAX_LATERAL_JERK = 3.0 + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL)  # ~3.6 m/s^3
+sec_since_boot = time.time
 
+def gen_solution(CS):
+  fix = 0
+  if CS.gpsAccuracy < 10.:
+    fix = 1
+  timestamp = int(
+    ((datetime.datetime.now() - datetime.datetime(1970, 1, 1)).total_seconds())
+    * 1e03
+  )
+  vN = math.cos(math.radians(CS.gpsHeading)) * CS.gpsVehicleSpeed
+  vE = math.sin(math.radians(CS.gpsHeading)) * CS.gpsVehicleSpeed
+  gps_fix = {
+    "bearingDeg": CS.gpsHeading,  # heading of motion in degrees
+    "altitude": CS.gpsElevation,  # altitude above ellipsoid
+    "latitude": CS.gpsLatitude,  # latitude in degrees
+    "longitude": CS.gpsLongitude,  # longitude in degrees
+    "speed": CS.gpsVehicleSpeed,  # ground speed in meters
+    "accuracy": CS.gpsAccuracy,  # horizontal accuracy (1 sigma?)
+    "unixTimestampMillis": timestamp,  # UTC time in ms since start of UTC stime
+    "vNED": [vN, vE, 0.0],  # velocity in NED frame in m/s
+    "speedAccuracy": 0.5,  # speed accuracy in m/s
+    "verticalAccuracy": 0.5,  # vertical accuracy in meters
+    "bearingAccuracyDeg": 0.5,  # heading accuracy in degrees
+    "source": "ublox",
+    "flags": fix,  # 1 of gpsAccuracy less than 2 meters
+  }
+  return log.Event.new_message(gpsLocationTesla=gps_fix)
 
-def get_max_angle_delta(v_ego_raw: float, VM: VehicleModel):
-  max_curvature_rate_sec = MAX_LATERAL_JERK / (max(v_ego_raw, 1) ** 2)  # (1/m)/s
-  max_angle_rate_sec = math.degrees(VM.get_steer_from_curvature(max_curvature_rate_sec, v_ego_raw, 0))  # deg/s
-  return max_angle_rate_sec * (DT_CTRL * CarControllerParams.STEER_STEP)
-
-
-def get_max_angle(v_ego_raw: float, VM: VehicleModel):
-  max_curvature = MAX_LATERAL_ACCEL / (max(v_ego_raw, 1) ** 2)  # 1/m
-  return math.degrees(VM.get_steer_from_curvature(max_curvature, v_ego_raw, 0))  # deg
-
-
-def apply_tesla_steer_angle_limits(apply_angle: float, apply_angle_last: float, v_ego_raw: float, steering_angle: float,
-                                   lat_active: bool, limits: AngleSteeringLimits, VM: VehicleModel) -> float:
-  # *** max lateral jerk limit ***
-  max_angle_delta = get_max_angle_delta(v_ego_raw, VM)
-
-  # prevent fault
-  max_angle_delta = min(max_angle_delta, MAX_ANGLE_RATE)
-  new_apply_angle = rate_limit(apply_angle, apply_angle_last, -max_angle_delta, max_angle_delta)
-
-  # *** max lateral accel limit ***
-  max_angle = get_max_angle(v_ego_raw, VM)
-  new_apply_angle = np.clip(new_apply_angle, -max_angle, max_angle)
-
-  # angle is current angle when inactive
-  if not lat_active:
-    new_apply_angle = steering_angle
-
-  # prevent fault
-  return float(np.clip(new_apply_angle, -limits.STEER_ANGLE_MAX, limits.STEER_ANGLE_MAX))
-
-
-def get_safety_CP():
-  # We use the TESLA_MODEL_Y platform for lateral limiting to match safety
-  # A Model 3 at 40 m/s using the Model Y limits sees a <0.3% difference in max angle (from curvature factor)
-  from opendbc.car.tesla.interface import CarInterface
-  return CarInterface.get_non_essential_params("TESLA_MODEL_Y")
-
-
-class CarController(CarControllerBase):
-  def __init__(self, dbc_names, CP):
-    super().__init__(dbc_names, CP)
+class CarController:
+  def __init__(self, dbc_name, CP, VM):
+    self.CP = CP
+    self.CCP = CarControllerParams(CP)
+    self.frame = 0
     self.apply_angle_last = 0
-    self.packer = CANPacker(dbc_names[Bus.party])
-    self.tesla_can = TeslaCAN(self.packer)
+    self.packer = CANPacker(dbc_name)
+    self.pt_packer = None
+    if DBC[CP.carFingerprint]['pt']:
+      self.pt_packer = CANPacker(DBC[CP.carFingerprint]['pt'])
+    self.tesla_can = TeslaCAN(self.packer, self.pt_packer)
+    self.prev_das_steeringControl_counter = -1
+    self.long_control_counter = 0
+    self.params = Params()
 
-    # Vehicle model used for lateral limiting
-    self.VM = VehicleModel(get_safety_CP())
+    #initialize modules
+    
+    self.hud_controller = HUDController(CP,self.packer,self.tesla_can)
+    pedalcan = 2
+    if load_bool_param("TinklaPedalCanZero", False):
+      pedalcan = 0
+    self.long_controller = LONGController(CP,self.packer,self.tesla_can,pedalcan)
+
+
+    self.cruiseDelayFrame = 0
+    self.prevCruiseEnabled = False
+
+    self.lP = messaging.sub_sock('longitudinalPlan') 
+    self.rS = messaging.sub_sock('radarState') 
+    self.mD = messaging.sub_sock('modelV2')
+    self.cS = messaging.sub_sock('controlsState')
+    self.long_control_counter = 0 
+    self.gpsLocationTesla = messaging.pub_sock("gpsLocationTesla")
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
+    pcm_cancel_cmd = CC.cruiseControl.cancel
+    CS.alca_direction = CC.rightBlinker * 2 + CC.leftBlinker
+    
+    if self.frame % 100 == 0:
+      CS.autoresumeAcc = load_bool_param("TinklaAutoResumeACC",False)
+
     can_sends = []
+    #add 0.6s second delay logic to wait for AP which has a status at 2Hz
+    if self.CP.carFingerprint != CAR.PREAP_MODELS and not CS.autopilot_disabled:
+      if CS.cruiseEnabled:
+        if not self.prevCruiseEnabled:
+          self.cruiseDelayFrame = self.frame
+          if CS.last_cruise_button == CruiseButtons.MAIN:
+            CS.enableACC = False
+          elif CS.last_cruise_button != CruiseButtons.IDLE:
+            CS.enableACC = True
+        if self.frame - self.cruiseDelayFrame >= 100:
+          CS.cruiseDelay = True
+      else:
+        self.cruiseDelayFrame = 0
+        CS.cruiseDelay = False
+        CS.enableACC = False
+    self.prevCruiseEnabled = CS.cruiseEnabled
 
-    # Tesla EPS enforces disabling steering on heavy lateral override force.
-    # When enabling in a tight curve, we wait until user reduces steering force to start steering.
-    # Canceling is done on rising edge and is handled generically with CC.cruiseControl.cancel
-    lat_active = CC.latActive and CS.hands_on_level < 3
+    #receive socks
+    long_plan = messaging.recv_one_or_none(self.lP)
+    radar_state = messaging.recv_one_or_none(self.rS)
+    model_data = messaging.recv_one_or_none(self.mD)
+    controls_state = messaging.recv_one_or_none(self.cS)
 
-    if self.frame % 2 == 0:
-      # Angular rate limit based on speed
-      self.apply_angle_last = apply_tesla_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
-                                                             CS.out.steeringAngleDeg, lat_active,
-                                                             CarControllerParams.ANGLE_LIMITS, self.VM)
+    if not CC.enabled:
+      self.v_target = CS.out.vEgo
+      self.a_target = 1
 
-      can_sends.append(self.tesla_can.create_steering_control(self.apply_angle_last, lat_active))
+    if CS.use_tesla_gps and (self.frame % 5 == 0):
+      if self.gpsLocationTesla is None:
+          self.gpsLocationTesla = messaging.pub_sock("gpsLocationTesla")
+      sol = gen_solution(CS)
+      sol.logMonoTime = int(sec_since_boot() * 1e9)
+      self.gpsLocationTesla.send(sol.to_bytes())
 
-    if self.frame % 10 == 0:
-      can_sends.append(self.tesla_can.create_steering_allowed())
+    # Cancel when openpilot is not enabled anymore and no autopilot
+    # BB: do we need to do this? AP/Tesla does not behave this way
+    #   LKAS can be disabled by steering and ACC remains engaged
+    #TODO: we need more logic arround this for AP0
+    if not CC.enabled and bool(CS.out.cruiseState.enabled) and not CS.enableHumanLongControl:
+      pcm_cancel_cmd = True
 
-    # Longitudinal control
-    if self.CP.openpilotLongitudinalControl:
-      if self.frame % 4 == 0:
-        state = 13 if CC.cruiseControl.cancel else 4  # 4=ACC_ON, 13=ACC_CANCEL_GENERIC_SILENT
-        accel = float(np.clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
-        cntr = (self.frame // 4) % 8
-        can_sends.append(self.tesla_can.create_longitudinal_command(state, accel, cntr, CS.out.vEgo, CC.longActive))
+    if ((self.frame % 10) == 0 and pcm_cancel_cmd):
+      stlk_counter = ((CS.msg_stw_actn_req['MC_STW_ACTN_RQ'] + 1) % 16)
+      can_sends.insert(0,self.tesla_can.create_action_request(CS.msg_stw_actn_req, CruiseButtons.CANCEL, CAN_CHASSIS[self.CP.carFingerprint],stlk_counter))
+      if (self.CP.carFingerprint in [CAR.AP1_MODELS,CAR.AP2_MODELS]):
+        can_sends.insert(1,self.tesla_can.create_action_request(CS.msg_stw_actn_req, CruiseButtons.CANCEL, CAN_AUTOPILOT[self.CP.carFingerprint],stlk_counter))
 
-    else:
-      # Increment counter so cancel is prioritized even without openpilot longitudinal
-      if CC.cruiseControl.cancel:
-        cntr = (CS.das_control["DAS_controlCounter"] + 1) % 8
-        can_sends.append(self.tesla_can.create_longitudinal_command(13, 0, cntr, CS.out.vEgo, False))
+    
 
-    # TODO: HUD control
-    new_actuators = actuators.as_builder()
+    if (self.frame % self.CCP.STEER_STEP == 0) and (CC.latActive or (self.CP.carFingerprint == CAR.PREAP_MODELS)):
+      #now process controls
+      if CC.latActive and (not CS.human_control) and (not CS.out.cruiseState.standstill):
+        # Angular rate limit based on speed
+        apply_angle = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgo, self.CCP)
+
+        # To not fault the EPS
+        apply_angle = clip(apply_angle, CS.out.steeringAngleDeg - 20, CS.out.steeringAngleDeg + 20)
+      else:
+        apply_angle = CS.out.steeringAngleDeg
+        
+      ldw_haptic = 0
+      if CC.hudControl.leftLaneDepart or CC.hudControl.rightLaneDepart:
+        ldw_haptic = 1
+      can_sends.append(self.tesla_can.create_steering_control(apply_angle, CC.latActive and (not CS.human_control) and (not CS.out.cruiseState.standstill), ldw_haptic, CAN_EPAS[self.CP.carFingerprint], 1))
+
+      self.apply_angle_last = apply_angle
+
+    #update LONG Control module
+    can_messages = self.long_controller.update(CC.enabled, CS, self.frame, actuators, pcm_cancel_cmd,CC.cruiseControl.override, long_plan,radar_state)
+    if len(can_messages) > 0:
+      if not (CS.enableACC and self.CP.carFingerprint != CAR.PREAP_MODELS):
+        can_sends[0:0] = can_messages
+
+    #update HUD Integration module
+    can_messages = self.hud_controller.update(controls_state, CC.enabled, CC, CS, self.frame, actuators, pcm_cancel_cmd, CC.hudControl.visualAlert, CC.hudControl.audibleAlert,
+          CC.hudControl.leftLaneVisible, CC.hudControl.rightLaneVisible, CC.hudControl.leadVisible, CC.hudControl.leftLaneDepart, CC.hudControl.rightLaneDepart,CS.human_control,radar_state,CS.lat_plan,self.apply_angle_last,model_data)
+    if len(can_messages) > 0:
+      can_sends.extend(can_messages)
+
+    new_actuators = actuators.copy()
     new_actuators.steeringAngleDeg = self.apply_angle_last
 
+    #once every 5 seconds save the follow distance to personality
+    if (self.frame % 500 == 0) and CS.out.followDistanceS != 255:
+      personality = log.LongitudinalPersonality.standard
+      if CS.out.followDistanceS < 3:
+        personality = log.LongitudinalPersonality.aggressive
+      if CS.out.followDistanceS > 5:
+        personality = log.LongitudinalPersonality.relaxed
+      self.params.put('LongitudinalPersonality',str(personality))
+
     self.frame += 1
+    
     return new_actuators, can_sends
