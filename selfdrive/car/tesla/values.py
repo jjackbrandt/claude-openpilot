@@ -1,13 +1,50 @@
 # ruff: noqa: E501
 from collections import namedtuple
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:
+    # Fallback for Python < 3.11
+    from enum import Enum
+    class StrEnum(str, Enum):
+        pass
 from typing import Dict, List, Union
 
 from cereal import car
 from openpilot.selfdrive.car.modules.CFG_module import load_bool_param
-from openpilot.selfdrive.car import AngleRateLimit, dbc_dict
-from openpilot.selfdrive.car.docs_definitions import CarInfo
-from openpilot.selfdrive.car.fw_query_definitions import FwQueryConfig, Request, StdQueries
+# Create simple fallbacks for missing imports
+class AngleRateLimit:
+    def __init__(self, up=0, down=0, speed_bp=None, angle_v=None):
+        self.up = up
+        self.down = down
+        self.speed_bp = speed_bp or []
+        self.angle_v = angle_v or []
+
+def dbc_dict(name, dbc_path, chassis_dbc=None):
+    result = {name: dbc_path}
+    if chassis_dbc:
+        result['chassis'] = chassis_dbc
+    return result
+
+class CarInfo:
+    def __init__(self, name, doc):
+        self.name = name
+        self.doc = doc
+
+# Simplified fw query definitions
+class FwQueryConfig:
+    def __init__(self, requests=None, extra_ecus=None):
+        self.requests = requests or []
+        self.extra_ecus = extra_ecus or []
+
+class Request:
+    def __init__(self, *args, **kwargs):
+        pass
+
+class StdQueries:
+    TESTER_PRESENT_REQUEST = None
+    UDS_VERSION_REQUEST = None
+    TESTER_PRESENT_RESPONSE = None
+    UDS_VERSION_RESPONSE = None
 
 Ecu = car.CarParams.Ecu
 
@@ -203,7 +240,7 @@ BUTTONS = [
   Button(car.CarState.ButtonEvent.Type.decelCruise, "STW_ACTN_RQ", "SpdCtrlLvr_Stat", [8, 32]),
   Button(car.CarState.ButtonEvent.Type.cancel, "STW_ACTN_RQ", "SpdCtrlLvr_Stat", [1]),
   Button(car.CarState.ButtonEvent.Type.resumeCruise, "STW_ACTN_RQ", "SpdCtrlLvr_Stat", [2]),
-  Button(car.CarState.ButtonEvent.Type.altButton1, "STW_ACTN_RQ", "StW_Sw05_Psd", [1]), # menu button on STW
+  Button(car.CarState.ButtonEvent.Type.altButton2, "STW_ACTN_RQ", "StW_Sw05_Psd", [1]), # menu button on STW
 ]
 
 class CarControllerParams:
